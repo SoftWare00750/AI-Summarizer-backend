@@ -1,12 +1,16 @@
 services:
   - type: web
     name: pagemind-backend
-    env: docker # Changed from 'node' to 'docker'
+    env: node
     region: oregon
     plan: free
+    buildCommand: npm install
+    startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 3000
+      - key: AIzaSyBaswrNTwDyeyZCvmq-zlpLP-nuPFvBRJk
+        sync: false   # set this manually in Render dashboard
     healthCheckPath: /health

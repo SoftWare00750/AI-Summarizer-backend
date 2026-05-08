@@ -1,32 +1,32 @@
-// server.js — PageMind AI Backend
-// Automates gemini.com to summarize pages without needing an API key.
-// Deploy on Render (Free tier works).
+// server.js — PageMind AI Backend v2
+// Automates gemini.google.com UI via Playwright to summarize pages.
+// No Gemini API key required. Deploy on Render (Free tier).
 
 import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: "*", // Chrome extensions need this
+  origin: "*",   // Chrome extensions require wildcard
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type"],
 }));
-app.use(express.json({ limit: "50kb" }));
+app.use(express.json({ limit: "100kb" }));
 
-// ── Browser pool ──────────────────────────────────────────────────────────────
-let browser = null;
-let browserLaunchTime = null;
-const BROWSER_MAX_AGE_MS = 30 * 60 * 1000; // Recycle browser every 30 min
+// ── Browser singleton ─────────────────────────────────────────────────────────
+let browser        = null;
+let browserBornAt  = null;
+const MAX_BROWSER_AGE_MS = 25 * 60 * 1000;
 
 async function getBrowser() {
   const now = Date.now();
-  if (browser && browserLaunchTime && (now - browserLaunchTime) < BROWSER_MAX_AGE_MS) {
+
+  if (browser && browserBornAt && (now - browserBornAt) < MAX_BROWSER_AGE_MS) {
     try {
-      // Check if browser is still alive
       await browser.version();
       return browser;
     } catch {
@@ -34,12 +34,12 @@ async function getBrowser() {
     }
   }
 
-  // Launch fresh browser
   if (browser) {
     try { await browser.close(); } catch {}
+    browser = null;
   }
 
-  console.log("Launching browser...");
+  console.log("[browser] Launching Chromium...");
   browser = await chromium.launch({
     headless: true,
     args: [
@@ -49,68 +49,77 @@ async function getBrowser() {
       "--disable-gpu",
       "--no-first-run",
       "--no-zygote",
-      "--single-process", // Required for Render free tier
+      "--single-process",
       "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--mute-audio",
     ],
   });
-  browserLaunchTime = Date.now();
-  console.log("Browser ready.");
+  browserBornAt = Date.now();
+  console.log("[browser] Ready.");
   return browser;
 }
 
-// ── Rate limiting (simple in-memory) ─────────────────────────────────────────
-const requestLog = new Map();
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 10; // requests per window per IP
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+const rateLimitMap = new Map();
+const RL_WINDOW_MS = 60_000;
+const RL_MAX       = 8;
 
 function checkRateLimit(ip) {
-  const now = Date.now();
-  const log = requestLog.get(ip) || [];
-  const recent = log.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
-  if (recent.length >= RATE_LIMIT_MAX) return false;
-  recent.push(now);
-  requestLog.set(ip, recent);
+  const now  = Date.now();
+  const hits = (rateLimitMap.get(ip) || []).filter(t => now - t < RL_WINDOW_MS);
+  if (hits.length >= RL_MAX) return false;
+  hits.push(now);
+  rateLimitMap.set(ip, hits);
   return true;
 }
 
-// ── Main summarize endpoint ───────────────────────────────────────────────────
+setInterval(() => {
+  const cutoff = Date.now() - RL_WINDOW_MS;
+  for (const [ip, hits] of rateLimitMap) {
+    const fresh = hits.filter(t => t > cutoff);
+    if (!fresh.length) rateLimitMap.delete(ip);
+    else rateLimitMap.set(ip, fresh);
+  }
+}, 5 * 60_000);
+
+// ── POST /summarize ───────────────────────────────────────────────────────────
 app.post("/summarize", async (req, res) => {
-  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
+  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown")
+    .split(",")[0].trim();
 
   if (!checkRateLimit(ip)) {
-    return res.status(429).json({ error: "RATE_LIMITED", message: "Too many requests. Please wait a moment." });
+    return res.status(429).json({ error: "RATE_LIMITED", message: "Too many requests — please wait a moment." });
   }
 
-  const { title, content, mode } = req.body;
+  const { title = "Untitled", content, mode = "default" } = req.body;
 
   if (!content || typeof content !== "string") {
     return res.status(400).json({ error: "INVALID_INPUT", message: "No page content provided." });
   }
-
-  if (content.length < 50) {
+  if (content.trim().length < 50) {
     return res.status(400).json({ error: "TOO_SHORT", message: "Page content is too short to summarize." });
   }
 
-  // Truncate to keep prompt reasonable
-  const truncated = content.slice(0, 5000);
+  const truncated = content.slice(0, 5000).trim();
 
-  const modeInstructions = {
-    brief:    "3 bullet points, 1 key insight, up to 3 topics",
-    default:  "4-6 bullet points, 3 key insights, up to 5 topics",
-    detailed: "7-10 bullet points, 5 key insights, up to 8 topics",
-  };
-  const instruction = modeInstructions[mode] || modeInstructions.default;
+  const modeCfg = {
+    brief:    { bullets: "3",    insights: "1", topics: "up to 3" },
+    default:  { bullets: "4-6",  insights: "3", topics: "up to 5" },
+    detailed: { bullets: "7-10", insights: "5", topics: "up to 8" },
+  }[mode] || { bullets: "4-6", insights: "3", topics: "up to 5" };
 
-  const prompt = `Analyze this webpage and respond ONLY with valid JSON (no markdown, no backticks, no explanation):
+  const prompt = `Analyze this webpage content and respond ONLY with a valid JSON object. No markdown, no backticks, no explanation.
 
-Page Title: ${title || "Untitled"}
+Page Title: ${title}
 
 Page Content:
 ${truncated}
 
 Respond with EXACTLY this JSON structure:
 {
-  "summary": ["point 1", "point 2"],
+  "summary": ["bullet point 1", "bullet point 2"],
   "keyInsights": ["insight 1"],
   "topics": ["topic1", "topic2"],
   "sentiment": "positive",
@@ -118,198 +127,215 @@ Respond with EXACTLY this JSON structure:
 }
 
 Rules:
-- summary: ${instruction.split(",")[0]}
-- keyInsights: ${instruction.split(",")[1] || "3 key insights"}
-- topics: ${instruction.split(",")[2] || "up to 5 topics"} (short keyword strings)
+- summary: ${modeCfg.bullets} concise bullet points
+- keyInsights: ${modeCfg.insights} deeper insights beyond the bullets
+- topics: ${modeCfg.topics} short keyword strings (1-3 words each)
 - sentiment: EXACTLY one of: positive, neutral, negative
 - contentType: EXACTLY one of: article, news, documentation, blog, other
-- Return ONLY the JSON object, nothing else.`;
+- Return ONLY the raw JSON. No other text.`;
 
   let page = null;
   try {
     const b = await getBrowser();
-    page = await b.newPage();
+    page    = await b.newPage();
 
-    // Block unnecessary resources for speed
-    await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,eot}", r => r.abort());
-    await page.route("**/analytics**", r => r.abort());
-    await page.route("**/gtag**", r => r.abort());
+    await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,eot,mp4,mp3}", r => r.abort());
+    await page.route("**/{analytics,gtag,doubleclick,ads}**", r => r.abort());
 
-    console.log(`[${new Date().toISOString()}] Navigating to gemini.com...`);
+    // ── Navigate ───────────────────────────────────────────────────────────
+    console.log(`[${ip}] Navigating to Gemini...`);
     await page.goto("https://gemini.google.com/app", {
-      waitUntil: "networkidle",
-      timeout: 30000,
+      waitUntil: "domcontentloaded",
+      timeout: 30_000,
     });
 
-    // Wait for the input field to be ready
-    // Gemini's main input is a contenteditable div or textarea
-    const inputSelector = 'rich-textarea div[contenteditable="true"], textarea[aria-label*="message"], div[data-testid="input-box"]';
-    await page.waitForSelector(inputSelector, { timeout: 15000 });
+    // ── Find input ─────────────────────────────────────────────────────────
+    const INPUT_SELECTORS = [
+      'rich-textarea div[contenteditable="true"]',
+      'div[contenteditable="true"][data-testid]',
+      'div.ql-editor[contenteditable="true"]',
+      'textarea[aria-label]',
+      'div[contenteditable="true"]',
+    ];
 
-    console.log("Input found, typing prompt...");
+    let inputEl = null;
+    for (const sel of INPUT_SELECTORS) {
+      try {
+        await page.waitForSelector(sel, { timeout: 12_000 });
+        inputEl = await page.$(sel);
+        if (inputEl) { console.log(`[${ip}] Input: ${sel}`); break; }
+      } catch { /* try next */ }
+    }
 
-    // Type the prompt into Gemini's input
-    const inputEl = await page.$(inputSelector);
+    if (!inputEl) throw new Error("GEMINI_INPUT_NOT_FOUND");
+
+    // ── Type prompt ────────────────────────────────────────────────────────
     await inputEl.click();
-    await inputEl.fill(prompt);
+    await page.waitForTimeout(300);
+    await page.keyboard.insertText(prompt);
+    await page.waitForTimeout(400);
 
-    // Small delay to ensure text is registered
-    await page.waitForTimeout(500);
-
-    // Submit — press Enter or click the send button
-    const sendBtnSelector = 'button[aria-label*="Send"], button[data-testid="send-button"], button[aria-label*="send"]';
-    const sendBtn = await page.$(sendBtnSelector);
-    if (sendBtn) {
-      await sendBtn.click();
-    } else {
-      await inputEl.press("Enter");
+    // ── Submit ─────────────────────────────────────────────────────────────
+    const SEND_SELECTORS = [
+      'button[aria-label*="Send"]',
+      'button[aria-label*="send"]',
+      'button[data-testid*="send"]',
+    ];
+    let sent = false;
+    for (const sel of SEND_SELECTORS) {
+      const btn = await page.$(sel);
+      if (btn) { await btn.click(); sent = true; break; }
     }
+    if (!sent) await page.keyboard.press("Enter");
+    console.log(`[${ip}] Prompt submitted.`);
 
-    console.log("Prompt submitted, waiting for response...");
+    // ── Wait for response ──────────────────────────────────────────────────
+    const RESPONSE_SELECTORS = [
+      "model-response .markdown",
+      "model-response .response-content",
+      ".response-content .markdown",
+      "message-content .markdown",
+      ".model-response-text",
+      "[data-testid='response-container']",
+    ];
 
-    // Wait for Gemini to respond — look for the response container
-    // Gemini streams responses, so we wait for streaming to complete
-    const responseSelector = 'message-content .markdown, model-response .response-content, [data-testid="response-container"] p, .response-content';
-    
-    // First wait for any response to appear
-    await page.waitForSelector(responseSelector, { timeout: 45000 });
-    
-    // Wait for streaming to finish — Gemini shows a "stop" button while generating
-    // We wait until the stop button disappears
+    let appeared = false;
+    for (const sel of RESPONSE_SELECTORS) {
+      try {
+        await page.waitForSelector(sel, { timeout: 40_000 });
+        appeared = true;
+        console.log(`[${ip}] Response selector matched: ${sel}`);
+        break;
+      } catch { /* try next */ }
+    }
+    if (!appeared) throw new Error("GEMINI_RESPONSE_TIMEOUT");
+
+    // Wait for streaming to finish
+    const STOP_BTN = 'button[aria-label*="Stop"], button[aria-label*="stop"]';
     try {
-      await page.waitForSelector('button[aria-label*="Stop"], button[data-testid="stop-button"]', { timeout: 5000 });
-      await page.waitForSelector('button[aria-label*="Stop"], button[data-testid="stop-button"]', { state: "hidden", timeout: 30000 });
+      await page.waitForSelector(STOP_BTN, { timeout: 4_000 });
+      await page.waitForSelector(STOP_BTN, { state: "hidden", timeout: 45_000 });
     } catch {
-      // Stop button might not appear for short responses, that's fine
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(2_500);
     }
 
-    // Extract the response text
-    const responseText = await page.evaluate(() => {
-      // Try multiple selectors to find Gemini's response
+    // ── Extract text ───────────────────────────────────────────────────────
+    const rawText = await page.evaluate(() => {
       const selectors = [
         "model-response .markdown",
         ".response-content .markdown",
+        "message-content .markdown",
+        ".model-response-text",
+        "model-response",
         "message-content",
-        "[data-testid='response-container']",
-        ".ProseMirror", // sometimes used for output
       ];
-      
       for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim().length > 20) {
-          return el.textContent.trim();
-        }
+        const els = document.querySelectorAll(sel);
+        if (!els.length) continue;
+        const last = els[els.length - 1];
+        const text = (last.innerText || last.textContent || "").trim();
+        if (text.length > 10) return text;
       }
-      
-      // Fallback: get all response-looking text
-      const allResponses = document.querySelectorAll(".response-container, .model-response, message-content");
-      if (allResponses.length > 0) {
-        const last = allResponses[allResponses.length - 1];
-        return last.textContent.trim();
-      }
-      
       return null;
     });
 
-    if (!responseText) {
-      throw new Error("Could not extract response from Gemini");
-    }
+    if (!rawText) throw new Error("GEMINI_EMPTY_RESPONSE");
 
-    console.log("Got response, parsing...");
-    const parsed = parseGeminiResponse(responseText);
+    console.log(`[${ip}] Parsing response (${rawText.length} chars)...`);
+    const parsed      = parseResponse(rawText);
     const readingTime = estimateReadingTime(content);
 
     return res.json({ ...parsed, readingTime, fromCache: false });
 
   } catch (err) {
-    console.error("Summarize error:", err.message);
+    console.error(`[${ip}] Error: ${err.message}`);
 
-    // If page got into bad state, close it and reset browser
-    if (err.message.includes("Target closed") || err.message.includes("Session closed")) {
+    if (/Target closed|Session closed|context was destroyed/i.test(err.message)) {
       browser = null;
     }
 
-    if (err.message.includes("timeout") || err.message.includes("Timeout")) {
-      return res.status(504).json({ error: "TIMEOUT", message: "Gemini took too long to respond. Please try again." });
-    }
-    if (err.message.includes("net::ERR") || err.message.includes("NETWORK")) {
-      return res.status(503).json({ error: "NETWORK_ERROR", message: "Could not reach Gemini. Check server connectivity." });
-    }
+    if (err.message === "GEMINI_INPUT_NOT_FOUND")
+      return res.status(503).json({ error: "SERVICE_ERROR", message: "Could not find Gemini input. UI may have changed — check server logs." });
+    if (err.message === "GEMINI_RESPONSE_TIMEOUT")
+      return res.status(504).json({ error: "TIMEOUT", message: "Gemini did not respond in time. Please try again." });
+    if (err.message === "GEMINI_EMPTY_RESPONSE")
+      return res.status(503).json({ error: "EMPTY_RESPONSE", message: "Gemini returned an empty response. Please try again." });
+    if (/timeout/i.test(err.message))
+      return res.status(504).json({ error: "TIMEOUT", message: "Request timed out. Please try again." });
+    if (/net::|ERR_|NETWORK/i.test(err.message))
+      return res.status(503).json({ error: "NETWORK_ERROR", message: "Network error reaching Gemini." });
 
-    return res.status(500).json({ error: "SERVER_ERROR", message: "Failed to get summary. Please try again." });
+    return res.status(500).json({ error: "SERVER_ERROR", message: "Unexpected server error. Please try again." });
 
   } finally {
-    if (page) {
-      try { await page.close(); } catch {}
-    }
+    if (page) try { await page.close(); } catch {}
   }
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
+// ── GET /health ───────────────────────────────────────────────────────────────
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString(), browser: !!browser });
 });
 
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.json({
     name: "PageMind AI Backend",
-    version: "1.0.0",
+    version: "2.0.0",
     status: "running",
+    note: "Summarizes pages via Gemini UI automation. No API key required.",
     endpoints: {
-      "POST /summarize": "Summarize page content via Gemini",
+      "POST /summarize": "{ title, content, mode } => { summary, keyInsights, topics, sentiment, contentType, readingTime }",
       "GET /health": "Health check",
     },
   });
 });
 
-// ── Parse Gemini's response ───────────────────────────────────────────────────
-function parseGeminiResponse(raw) {
-  if (!raw) return buildFallback("Empty response from AI.");
-
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function parseResponse(raw) {
+  if (!raw) return fallback("Empty response.");
   try {
     let cleaned = raw.trim()
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/\s*```\s*$/i, "")
+      .replace(/^```json\s*/im, "")
+      .replace(/^```\s*/im, "")
+      .replace(/\s*```\s*$/im, "")
       .trim();
 
-    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-    if (jsonMatch) cleaned = jsonMatch[0];
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("No JSON object found");
+    const p = JSON.parse(match[0]);
 
-    const parsed = JSON.parse(cleaned);
-    const validSentiments = ["positive", "neutral", "negative"];
+    const validSentiments   = ["positive", "neutral", "negative"];
     const validContentTypes = ["article", "news", "documentation", "blog", "other"];
 
     return {
-      summary: Array.isArray(parsed.summary)
-        ? parsed.summary.filter(s => typeof s === "string" && s.trim())
-        : ["No summary available."],
-      keyInsights: Array.isArray(parsed.keyInsights)
-        ? parsed.keyInsights.filter(s => typeof s === "string" && s.trim())
-        : [],
-      topics: Array.isArray(parsed.topics)
-        ? parsed.topics.filter(s => typeof s === "string" && s.trim())
-        : [],
-      sentiment: validSentiments.includes(parsed.sentiment) ? parsed.sentiment : "neutral",
-      contentType: validContentTypes.includes(parsed.contentType) ? parsed.contentType : "other",
+      summary:     toStringArray(p.summary, "No summary available."),
+      keyInsights: toStringArray(p.keyInsights),
+      topics:      toStringArray(p.topics),
+      sentiment:   validSentiments.includes(p.sentiment)    ? p.sentiment    : "neutral",
+      contentType: validContentTypes.includes(p.contentType) ? p.contentType : "other",
     };
   } catch {
-    // Try to salvage partial JSON
-    const summaryMatch = raw.match(/"summary"\s*:\s*\[([\s\S]*?)\]/);
-    if (summaryMatch) {
+    // Salvage: try to pull summary array out manually
+    const m = raw.match(/"summary"\s*:\s*\[([\s\S]*?)\]/);
+    if (m) {
       try {
-        const partialSummary = JSON.parse(`[${summaryMatch[1]}]`);
-        if (Array.isArray(partialSummary) && partialSummary.length > 0) {
-          return { summary: partialSummary, keyInsights: [], topics: [], sentiment: "neutral", contentType: "other" };
+        const arr = JSON.parse(`[${m[1]}]`);
+        if (Array.isArray(arr) && arr.length) {
+          return { summary: arr, keyInsights: [], topics: [], sentiment: "neutral", contentType: "other" };
         }
       } catch {}
     }
-    return buildFallback("Could not parse AI response.");
+    return fallback("Could not parse AI response.");
   }
 }
 
-function buildFallback(msg) {
+function toStringArray(val, fallbackItem) {
+  if (!Array.isArray(val)) return fallbackItem ? [fallbackItem] : [];
+  const filtered = val.filter(s => typeof s === "string" && s.trim());
+  return filtered.length ? filtered : (fallbackItem ? [fallbackItem] : []);
+}
+
+function fallback(msg) {
   return { summary: [msg], keyInsights: [], topics: [], sentiment: "neutral", contentType: "other" };
 }
 
@@ -320,12 +346,10 @@ function estimateReadingTime(text) {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`PageMind backend running on port ${PORT}`);
-  console.log("Pre-warming browser...");
-  getBrowser().catch(err => console.error("Browser pre-warm failed:", err.message));
+  console.log(`PageMind backend v2 running on port ${PORT}`);
+  getBrowser().catch(err => console.error("[browser] Pre-warm failed:", err.message));
 });
 
-// Graceful shutdown
 process.on("SIGTERM", async () => {
   console.log("Shutting down...");
   if (browser) await browser.close().catch(() => {});

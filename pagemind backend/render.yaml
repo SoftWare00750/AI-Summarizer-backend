@@ -1,16 +1,12 @@
 services:
   - type: web
     name: pagemind-backend
-    env: node
+    env: docker # Changed from 'node' to 'docker'
     region: oregon
     plan: free
-    buildCommand: npm install && npx playwright install chromium --with-deps
-    startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 3000
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/.cache/ms-playwright
     healthCheckPath: /health

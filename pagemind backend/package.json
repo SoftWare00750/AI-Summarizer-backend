@@ -1,7 +1,7 @@
 {
   "name": "pagemind-backend",
-  "version": "1.0.0",
-  "description": "PageMind AI summarizer backend — automates Gemini via browser",
+  "version": "2.0.0",
+  "description": "PageMind AI summarizer backend — automates Gemini UI via Playwright",
   "type": "module",
   "main": "server.js",
   "scripts": {

@@ -1,20 +1,18 @@
-// server.js — PageMind AI Backend v4
-// Uses the official Google Gemini API — no browser automation needed.
-// Faster, more reliable, and works on any hosting platform.
+// server.js — PageMind AI Backend v5 (Groq added as fallback)
+// Primary: Groq API (free, fast). Fallback: Gemini API.
 
 import express from "express";
 import cors from "cors";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const PORT            = process.env.PORT || 3000;
+const GEMINI_API_KEY  = process.env.GEMINI_API_KEY;
+const GROQ_API_KEY    = process.env.GROQ_API_KEY;
 
 app.use(cors({ origin: "*", methods: ["GET", "POST"], allowedHeaders: ["Content-Type"] }));
 app.use(express.json({ limit: "100kb" }));
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Rate limiter (unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Rate limiter ──────────────────────────────────────────────────────────────
 const rateLog = new Map();
 function checkRate(ip) {
   const now    = Date.now();
@@ -26,9 +24,7 @@ function checkRate(ip) {
   return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Smart content truncation (unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Smart content truncation ──────────────────────────────────────────────────
 function smartTruncate(text, max = 4000) {
   if (text.length <= max) return text;
   const head = text.slice(0, max - 600).trimEnd();
@@ -36,9 +32,7 @@ function smartTruncate(text, max = 4000) {
   return `${head}\n\n[…content trimmed…]\n\n${tail}`;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Build prompt (unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Prompt builder ────────────────────────────────────────────────────────────
 function buildPrompt(title, content, mode) {
   const modeMap = {
     brief:    { bullets: 3, insights: 1, topics: 3 },
@@ -48,8 +42,7 @@ function buildPrompt(title, content, mode) {
   const { bullets, insights, topics } = modeMap[mode] || modeMap.default;
   const body = smartTruncate(content);
 
-  return (
-`You are a precise webpage summarizer. Read the content below and respond with a single JSON object — no markdown fences, no explanation, no extra text before or after.
+  return `You are a precise webpage summarizer. Read the content below and respond with a single JSON object — no markdown fences, no explanation, no extra text before or after.
 
 TITLE: ${title || "Untitled"}
 
@@ -72,40 +65,58 @@ STRICT RULES:
 4. sentiment must be one of the three exact strings above.
 5. contentType must be one of the five exact strings above.
 6. Do NOT include backticks, markdown, or any text outside the JSON object.
-7. All strings must be in English.`
-  );
+7. All strings must be in English.`;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Call Gemini API directly (replaces all Playwright logic)
-// Uses gemini-2.0-flash — fastest + free tier available
-// ─────────────────────────────────────────────────────────────────────────────
-async function askGemini(prompt) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY environment variable is not set.");
-  }
+// ── Groq API (OpenAI-compatible, free tier) ───────────────────────────────────
+async function askGroq(prompt) {
+  if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY not configured.");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-
-  const body = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.1,       // low temp = more deterministic JSON output
-      maxOutputTokens: 1024,
-    },
-  };
-
-  const res = await fetch(url, {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000), // 30s hard timeout
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "llama-3.3-70b-versatile",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1,
+      max_tokens: 1024,
+    }),
+    signal: AbortSignal.timeout(30_000),
   });
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    const msg = err?.error?.message || `HTTP ${res.status}`;
-    throw new Error(`Gemini API error: ${msg}`);
+    throw new Error(`Groq API error: ${err?.error?.message || `HTTP ${res.status}`}`);
+  }
+
+  const data = await res.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) throw new Error("Empty response from Groq API.");
+  return text;
+}
+
+// ── Gemini API ────────────────────────────────────────────────────────────────
+async function askGemini(prompt) {
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured.");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: 1024 },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(`Gemini API error: ${err?.error?.message || `HTTP ${res.status}`}`);
   }
 
   const data = await res.json();
@@ -114,9 +125,30 @@ async function askGemini(prompt) {
   return text;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Parse response (unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Ask AI — try Groq first, fall back to Gemini ─────────────────────────────
+async function askAI(prompt) {
+  if (GROQ_API_KEY) {
+    try {
+      console.log("[ai] trying Groq...");
+      const result = await askGroq(prompt);
+      console.log("[ai] Groq success");
+      return result;
+    } catch (err) {
+      console.warn("[ai] Groq failed, falling back to Gemini:", err.message);
+    }
+  }
+
+  if (GEMINI_API_KEY) {
+    console.log("[ai] trying Gemini...");
+    const result = await askGemini(prompt);
+    console.log("[ai] Gemini success");
+    return result;
+  }
+
+  throw new Error("No AI provider configured. Set GROQ_API_KEY or GEMINI_API_KEY.");
+}
+
+// ── Parse response ────────────────────────────────────────────────────────────
 function parseResponse(raw) {
   if (!raw) return fallback("Empty response from AI.");
 
@@ -146,7 +178,7 @@ function parseResponse(raw) {
       contentType: CONTENT_TYPES.includes(p.contentType) ? p.contentType  : "other",
     };
   } catch (e) {
-    console.warn("[parse] JSON.parse failed, attempting field extraction…", e.message);
+    console.warn("[parse] JSON.parse failed:", e.message);
 
     const extractArray = (field) => {
       const m = raw.match(new RegExp(`"${field}"\\s*:\\s*\\[([\\s\\S]*?)\\]`));
@@ -190,9 +222,7 @@ function estimateReadingTime(text) {
   return Math.max(1, Math.ceil(text.trim().split(/\s+/).filter(Boolean).length / 238));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /summarize
-// ─────────────────────────────────────────────────────────────────────────────
+// ── POST /summarize ───────────────────────────────────────────────────────────
 app.post("/summarize", async (req, res) => {
   const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown")
     .split(",")[0].trim();
@@ -213,7 +243,7 @@ app.post("/summarize", async (req, res) => {
     console.log(`[req] mode=${mode || "default"} len=${content.length} ip=${ip}`);
 
     const prompt      = buildPrompt(title, content, mode);
-    const rawResponse = await askGemini(prompt);
+    const rawResponse = await askAI(prompt);
     const parsed      = parseResponse(rawResponse);
     const readingTime = estimateReadingTime(content);
     const elapsed     = ((Date.now() - t0) / 1000).toFixed(1);
@@ -225,51 +255,47 @@ app.post("/summarize", async (req, res) => {
     console.error("[req] error:", err.message);
 
     if (err.name === "TimeoutError" || err.message.toLowerCase().includes("timeout"))
-      return res.status(504).json({ error: "TIMEOUT", message: "Gemini took too long. Please try again." });
-    if (err.message.includes("GEMINI_API_KEY"))
-      return res.status(500).json({ error: "CONFIG_ERROR", message: "API key not configured on server." });
-    if (err.message.includes("Gemini API error"))
+      return res.status(504).json({ error: "TIMEOUT", message: "AI took too long. Please try again." });
+    if (err.message.includes("not configured"))
+      return res.status(500).json({ error: "CONFIG_ERROR", message: "No AI provider configured on server." });
+    if (err.message.includes("Groq API error") || err.message.includes("Gemini API error"))
       return res.status(502).json({ error: "API_ERROR", message: err.message });
 
     return res.status(500).json({ error: "SERVER_ERROR", message: "Failed to get summary. Please try again." });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Health & root
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Health & root ─────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) =>
   res.json({
     status: "ok",
     uptime: process.uptime().toFixed(0) + "s",
     time: new Date().toISOString(),
-    apiKeyConfigured: !!GEMINI_API_KEY,
+    groqConfigured:   !!GROQ_API_KEY,
+    geminiConfigured: !!GEMINI_API_KEY,
   })
 );
 
 app.get("/", (_req, res) =>
   res.json({
     name: "PageMind AI Backend",
-    version: "4.0.0",
+    version: "5.0.0",
     status: "running",
-    engine: "Gemini API (direct)",
-    apiKeyConfigured: !!GEMINI_API_KEY,
+    engine: GROQ_API_KEY ? "Groq (primary)" : "Gemini (fallback)",
+    groqConfigured:   !!GROQ_API_KEY,
+    geminiConfigured: !!GEMINI_API_KEY,
   })
 );
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Start
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`PageMind backend v4 on port ${PORT}`);
-  if (!GEMINI_API_KEY) {
-    console.warn("⚠️  WARNING: GEMINI_API_KEY is not set. /summarize will return errors.");
+  console.log(`PageMind backend v5 on port ${PORT}`);
+  if (!GROQ_API_KEY && !GEMINI_API_KEY) {
+    console.warn("⚠️  WARNING: Neither GROQ_API_KEY nor GEMINI_API_KEY is set.");
   } else {
-    console.log("✅ Gemini API key configured.");
+    if (GROQ_API_KEY)   console.log("✅ Groq API key configured (primary).");
+    if (GEMINI_API_KEY) console.log("✅ Gemini API key configured (fallback).");
   }
 });
 
-process.on("SIGTERM", () => {
-  console.log("Shutting down…");
-  process.exit(0);
-});
+process.on("SIGTERM", () => { console.log("Shutting down…"); process.exit(0); });

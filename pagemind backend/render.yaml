@@ -11,6 +11,6 @@ services:
         value: production
       - key: PORT
         value: 3000
-      - key: AIzaSyBaswrNTwDyeyZCvmq-zlpLP-nuPFvBRJk
-        sync: false   # set this manually in Render dashboard
+       -key: GEMINI_API_KEY
+        sync: false   # then set the value manually in the Render dashboard
     healthCheckPath: /health
